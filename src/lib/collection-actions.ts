@@ -369,7 +369,7 @@ export async function promoteCollection(
 		const seeded = tagged.map((item) => toCollectionItem(item, me));
 
 		const dek = await importDek(dekB64, false);
-		await syncCollectionItems(collection.id, dek, [], () => seeded);
+		await syncCollectionItems(collection.id, dek, [], () => seeded, collection.memberDekVersion);
 
 		// Only now that the blob is durably written do the local copies go. Soft
 		// deletes, so the removal propagates to this account's other devices
@@ -422,7 +422,7 @@ export async function loadCollectionItems(
 	try {
 		const dekB64 = await openCollectionKey(collection.wrappedKey);
 		const dek = await importDek(dekB64, false);
-		return await fetchCollectionState(collection.id, dek);
+		return await fetchCollectionState(collection.id, dek, collection.memberDekVersion);
 	} catch (e) {
 		deps.setError(e instanceof Error ? e.message : 'Could not load this collection.');
 		return { items: [], ballots: {} };
@@ -450,14 +450,19 @@ export async function toggleCollectionWatched(
 	try {
 		const dekB64 = await openCollectionKey(collection.wrappedKey);
 		const dek = await importDek(dekB64, false);
-		return await syncCollectionItems(collection.id, dek, current, (merged) =>
-			merged.map((i) => {
-				if (i.tmdb_id !== item.tmdb_id || i.media_type !== item.media_type) return i;
-				const watch = { ...(i.watch ?? {}) };
-				if (watched) watch[myAccountId] = new Date().toISOString();
-				else delete watch[myAccountId];
-				return { ...i, watch };
-			})
+		return await syncCollectionItems(
+			collection.id,
+			dek,
+			current,
+			(merged) =>
+				merged.map((i) => {
+					if (i.tmdb_id !== item.tmdb_id || i.media_type !== item.media_type) return i;
+					const watch = { ...(i.watch ?? {}) };
+					if (watched) watch[myAccountId] = new Date().toISOString();
+					else delete watch[myAccountId];
+					return { ...i, watch };
+				}),
+			collection.memberDekVersion
 		);
 	} catch (e) {
 		deps.setError(e instanceof Error ? e.message : 'Could not save that. Try again.');
@@ -489,16 +494,21 @@ export async function setCollectionItemNote(
 	try {
 		const dekB64 = await openCollectionKey(collection.wrappedKey);
 		const dek = await importDek(dekB64, false);
-		return await syncCollectionItems(collection.id, dek, current, (merged) =>
-			merged.map((i) =>
-				i.tmdb_id !== item.tmdb_id || i.media_type !== item.media_type
-					? i
-					: // updated_at must move forward here — unlike `watch` (merged
-						// per-account, LWW-exempt), `notes` falls under mergeCollectionItem's
-						// generic whole-field LWW bucket. Without a fresh timestamp this
-						// edit could lose to a stale `updated_at` on the next merge.
-						{ ...i, notes: notes ?? undefined, updated_at: new Date().toISOString() }
-			)
+		return await syncCollectionItems(
+			collection.id,
+			dek,
+			current,
+			(merged) =>
+				merged.map((i) =>
+					i.tmdb_id !== item.tmdb_id || i.media_type !== item.media_type
+						? i
+						: // updated_at must move forward here — unlike `watch` (merged
+							// per-account, LWW-exempt), `notes` falls under mergeCollectionItem's
+							// generic whole-field LWW bucket. Without a fresh timestamp this
+							// edit could lose to a stale `updated_at` on the next merge.
+							{ ...i, notes: notes ?? undefined, updated_at: new Date().toISOString() }
+				),
+			collection.memberDekVersion
 		);
 	} catch (e) {
 		deps.setError(e instanceof Error ? e.message : 'Could not save that note.');
@@ -532,10 +542,16 @@ export async function setMyBallot(
 			items: itemsInOrder.slice(0, MAX_BALLOT_SIZE),
 			updatedAt: new Date().toISOString()
 		};
-		return await syncCollectionBallots(collection.id, dek, currentBallots, (merged) => ({
-			...merged,
-			[myAccountId]: entry
-		}));
+		return await syncCollectionBallots(
+			collection.id,
+			dek,
+			currentBallots,
+			(merged) => ({
+				...merged,
+				[myAccountId]: entry
+			}),
+			collection.memberDekVersion
+		);
 	} catch (e) {
 		deps.setError(e instanceof Error ? e.message : 'Could not save your ranking. Try again.');
 		return null;
@@ -634,13 +650,19 @@ export async function addItemsToSharedCollection(
 		const dekB64 = await openCollectionKey(collection.wrappedKey);
 		const dek = await importDek(dekB64, false);
 
-		await syncCollectionItems(collection.id, dek, [], (merged) => {
-			const existingKeys = new Set(merged.map((i) => itemKey(i)));
-			const additions = items
-				.filter((item) => !existingKeys.has(itemKey(item)))
-				.map((item) => toCollectionItem(item, me));
-			return [...merged, ...additions];
-		});
+		await syncCollectionItems(
+			collection.id,
+			dek,
+			[],
+			(merged) => {
+				const existingKeys = new Set(merged.map((i) => itemKey(i)));
+				const additions = items
+					.filter((item) => !existingKeys.has(itemKey(item)))
+					.map((item) => toCollectionItem(item, me));
+				return [...merged, ...additions];
+			},
+			collection.memberDekVersion
+		);
 
 		for (const item of items) {
 			await removeItem(item.id);
@@ -677,8 +699,13 @@ export async function removeItemFromSharedCollection(
 	try {
 		const dekB64 = await openCollectionKey(collection.wrappedKey);
 		const dek = await importDek(dekB64, false);
-		return await syncCollectionItems(collection.id, dek, current, (merged) =>
-			merged.filter((i) => i.tmdb_id !== item.tmdb_id || i.media_type !== item.media_type)
+		return await syncCollectionItems(
+			collection.id,
+			dek,
+			current,
+			(merged) =>
+				merged.filter((i) => i.tmdb_id !== item.tmdb_id || i.media_type !== item.media_type),
+			collection.memberDekVersion
 		);
 	} catch (e) {
 		deps.setError(e instanceof Error ? e.message : 'Could not remove that. Try again.');

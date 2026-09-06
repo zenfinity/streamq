@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { generateShareKey, importDek } from './crypto';
 import { gzip } from './gzip';
 import {
@@ -14,6 +14,15 @@ import {
 	type CollectionItem,
 	type BallotEntry
 } from './collection-sync';
+
+const reportFailure = vi.fn();
+vi.mock('./report-failure', () => ({
+	reportFailure: (...args: unknown[]) => reportFailure(...args)
+}));
+
+beforeEach(() => {
+	reportFailure.mockReset();
+});
 
 const ALICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const BOB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -218,6 +227,61 @@ describe('fetchCollectionState', () => {
 		);
 
 		expect((await fetchCollectionState(COLL, dek)).items).toEqual([]);
+		expect(reportFailure).toHaveBeenCalledWith('backup_item_parse_rejected');
+	});
+
+	it('does not report a parse rejection when every item is well-formed', async () => {
+		const getDek = makeCrypto();
+		const dek = await getDek();
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async () => pulledResponse([item()], dek, 1))
+		);
+
+		await fetchCollectionState(COLL, dek);
+		expect(reportFailure).not.toHaveBeenCalledWith('backup_item_parse_rejected');
+	});
+
+	it('reports and throws CollectionKeyRotatedError when the blob is under a generation this client does not hold, without attempting to decrypt', async () => {
+		const getDek = makeCrypto();
+		const dek = await getDek();
+		const fetchMock = vi.fn(async () => pulledResponse([item()], dek, 1, 2));
+		vi.stubGlobal('fetch', fetchMock);
+
+		await expect(fetchCollectionState(COLL, dek, 1)).rejects.toBeInstanceOf(
+			CollectionKeyRotatedError
+		);
+		expect(reportFailure).toHaveBeenCalledWith('collection_dek_mismatch');
+	});
+
+	it('does not check dek version when the caller has no expectation to compare against', async () => {
+		const getDek = makeCrypto();
+		const dek = await getDek();
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async () => pulledResponse([item()], dek, 1, 2))
+		);
+
+		// No expectedDekVersion passed — same behavior as before #254.
+		await expect(fetchCollectionState(COLL, dek)).resolves.toBeTruthy();
+		expect(reportFailure).not.toHaveBeenCalled();
+	});
+
+	it('reports collection_decrypt_failed when decryption fails despite the dek version matching', async () => {
+		const getDek = makeCrypto();
+		const dek = await getDek();
+		const wrongDek = await getDek();
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async () => pulledResponse([item()], wrongDek, 1, 1))
+		);
+
+		// expectedDekVersion (1) matches the header (1), so this isn't a
+		// generation mismatch — decrypting with the wrong key nonetheless
+		// throws, and that's the genuine-corruption case.
+		await expect(fetchCollectionState(COLL, dek, 1)).rejects.toThrow();
+		expect(reportFailure).toHaveBeenCalledWith('collection_decrypt_failed');
+		expect(reportFailure).not.toHaveBeenCalledWith('collection_dek_mismatch');
 	});
 
 	it('returns an empty ballots map for an empty or missing blob', async () => {
@@ -368,6 +432,7 @@ describe('syncCollectionItems — the 409 retry loop', () => {
 		await expect(syncCollectionItems(COLL, dek, [], (merged) => merged)).rejects.toThrow(
 			/repeated conflicts/i
 		);
+		expect(reportFailure).toHaveBeenCalledWith('collection_sync_409_exhausted');
 	}, 15000);
 
 	it('surfaces a rotated-key conflict distinctly from a version conflict', async () => {
@@ -385,6 +450,7 @@ describe('syncCollectionItems — the 409 retry loop', () => {
 		await expect(syncCollectionItems(COLL, dek, [], (m) => m)).rejects.toBeInstanceOf(
 			CollectionKeyRotatedError
 		);
+		expect(reportFailure).toHaveBeenCalledWith('collection_key_rotated');
 	});
 
 	it('relays existing ballots through unchanged on an item-only mutation', async () => {
@@ -496,6 +562,7 @@ describe('syncCollectionBallots — the 409 retry loop', () => {
 		await expect(syncCollectionBallots(COLL, dek, {}, (merged) => merged)).rejects.toThrow(
 			/repeated conflicts/i
 		);
+		expect(reportFailure).toHaveBeenCalledWith('collection_sync_409_exhausted');
 	}, 15000);
 });
 

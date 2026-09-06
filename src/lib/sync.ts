@@ -26,6 +26,7 @@ import {
 import { ensureKeypair } from './keypair';
 import { importDek, encryptBytesWithDek, decryptBytesWithDek } from './crypto';
 import { gzip, gunzip } from './gzip';
+import { reportFailure } from './report-failure';
 
 const BLOB_URL = '/api/sync/blob';
 const MAX_RETRIES = 5;
@@ -369,6 +370,11 @@ async function runSyncCycle(dek: CryptoKey): Promise<void> {
 			remoteItems = parsed.items;
 			remotePrefs = parsed.prefs;
 			remoteServices = parsed.services;
+			// A well-formed-looking item from another of this account's own
+			// devices failing validation is otherwise unknowable (#254) — this
+			// isn't a hand-edited backup file, it's this same sync engine's own
+			// output on a different device.
+			if (parsed.rejectedItemCount > 0) reportFailure('backup_item_parse_rejected');
 		}
 
 		const [localSnapshot, localServicesUpdatedAt, lastPushedAt] = await Promise.all([
@@ -424,6 +430,7 @@ async function runSyncCycle(dek: CryptoKey): Promise<void> {
 		// re-merge (idempotent; merging the same local state again against a
 		// newer remote is safe), re-PUT.
 	}
+	reportFailure('sync_409_exhausted');
 	throw new Error('Sync failed after repeated version conflicts');
 }
 

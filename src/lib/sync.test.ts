@@ -7,6 +7,11 @@ import { generateShareKey, encryptBytesWithDek, importDek } from './crypto';
 import { gzip } from './gzip';
 import { mergeItems, enableSyncWithDek, isSyncEnabled, disableSync, syncNow } from './sync';
 
+const reportFailure = vi.fn();
+vi.mock('./report-failure', () => ({
+	reportFailure: (...args: unknown[]) => reportFailure(...args)
+}));
+
 // db.ts caches a single open IDBDatabase connection for the module's
 // lifetime — clear both stores through the module's own functions between
 // tests rather than deleting/recreating the database (see db.test.ts).
@@ -14,6 +19,7 @@ beforeEach(async () => {
 	await db.replaceAll([]);
 	await db.setServices([]);
 	await disableSync();
+	reportFailure.mockReset();
 });
 
 function makeItem(overrides: Partial<WatchlistItem> = {}): WatchlistItem {
@@ -434,5 +440,62 @@ describe('syncNow', () => {
 		await expect(syncNow()).resolves.toBeUndefined();
 		expect(getCalls).toBe(2);
 		expect(putCalls).toBe(2);
+	});
+
+	it('reports sync_409_exhausted after MAX_RETRIES consecutive conflicts (#254)', async () => {
+		const dek = await generateShareKey();
+		await enableSyncWithDek(dek, 'user@example.com');
+		await db.addItem(makeBackupItem({ tmdb_id: 1 }) as never);
+
+		vi.stubGlobal(
+			'fetch',
+			vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+				const method = init?.method ?? 'GET';
+				if (method === 'GET') {
+					return new Response(new ArrayBuffer(0), { headers: { 'X-Sync-Version': '0' } });
+				}
+				return new Response(JSON.stringify({ error: 'conflict' }), { status: 409 });
+			})
+		);
+
+		await expect(syncNow()).rejects.toThrow('repeated version conflicts');
+		expect(reportFailure).toHaveBeenCalledWith('sync_409_exhausted');
+	});
+
+	it('reports backup_item_parse_rejected when a pulled item fails validation (#254)', async () => {
+		const dek = await generateShareKey();
+		await enableSyncWithDek(dek, 'user@example.com');
+
+		// A well-formed-looking item missing the one field parseBackupItem
+		// requires (title) alongside a genuinely valid one — the invalid entry
+		// should be silently dropped from the merge *and* reported, the valid
+		// one should still make it through.
+		const remoteBlob = await buildRemoteBlob(dek, {
+			version: 2,
+			prefs: {},
+			items: [
+				{ tmdb_id: 1, media_type: 'movie', title: 'Valid Item' },
+				{ tmdb_id: 2, media_type: 'movie' }
+			],
+			services: []
+		});
+
+		vi.stubGlobal(
+			'fetch',
+			mockFetchSequence([
+				async () => new Response(remoteBlob, { headers: { 'X-Sync-Version': '1' } }),
+				async () =>
+					new Response(JSON.stringify({ version: 2 }), {
+						status: 200,
+						headers: { Date: new Date().toUTCString() }
+					})
+			])
+		);
+
+		await syncNow();
+
+		expect(reportFailure).toHaveBeenCalledWith('backup_item_parse_rejected');
+		const all = await db.getAll();
+		expect(all.map((i) => i.title)).toEqual(['Valid Item']);
 	});
 });

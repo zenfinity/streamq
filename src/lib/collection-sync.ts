@@ -16,6 +16,7 @@ import { parseBackupItemPublic, type BackupItem } from './app-state';
 import { decryptBytesWithDek, encryptBytesWithDek } from './crypto';
 import { gzip, gunzip } from './gzip';
 import { validateIsoDate } from './validate';
+import { reportFailure } from './report-failure';
 
 const MAX_RETRIES = 5;
 const BASE_BACKOFF_MS = 200;
@@ -207,29 +208,57 @@ export class CollectionKeyRotatedError extends Error {
 	}
 }
 
+/**
+ * `expectedDekVersion` — the caller's own memberDekVersion, i.e. the
+ * generation its `dek` was actually unwrapped under — lets this function
+ * tell "encrypted under a generation I don't hold" from "corrupt" (#254)
+ * *before* attempting to decrypt, the same distinction the PUT side already
+ * makes server-side (blob/+server.ts's memberDekVersion/collectionDekVersion
+ * check). Without it, a partial key rotation surfaces as a generic decrypt
+ * failure indistinguishable from real corruption — the exact ambiguity
+ * X-Collection-Dek-Version exists to resolve. Optional and skipped when
+ * omitted: a caller with no independent notion of its own generation (there
+ * isn't one currently) simply attempts decrypt and reports whatever
+ * happens as collection_decrypt_failed.
+ */
 async function pullCollectionBlob(
 	collectionId: string,
-	dek: CryptoKey
+	dek: CryptoKey,
+	expectedDekVersion?: number
 ): Promise<PulledCollectionBlob> {
 	const res = await fetch(collectionBlobUrl(collectionId), { credentials: 'same-origin' });
 	if (!res.ok) throw new Error(`Collection sync GET failed: ${res.status}`);
 
 	const version = Number(res.headers.get('X-Sync-Version') ?? '0');
 	const dekVersion = Number(res.headers.get('X-Collection-Dek-Version') ?? '1');
+	if (expectedDekVersion !== undefined && dekVersion !== expectedDekVersion) {
+		reportFailure('collection_dek_mismatch');
+		throw new CollectionKeyRotatedError();
+	}
+
 	const bytes = await res.arrayBuffer();
 	if (bytes.byteLength === 0) return { version, dekVersion, items: [], ballots: {} };
 
-	const plainGz = await decryptBytesWithDek(bytes, dek);
-	const json = new TextDecoder().decode(await gunzip(plainGz));
+	let json: string;
+	try {
+		const plainGz = await decryptBytesWithDek(bytes, dek);
+		json = new TextDecoder().decode(await gunzip(plainGz));
+	} catch (e) {
+		reportFailure('collection_decrypt_failed');
+		throw e;
+	}
 	const parsed = JSON.parse(json) as { items?: unknown[]; ballots?: unknown };
 
 	// Every item is re-validated through the same untrusted-payload allowlist
 	// as a personal backup, not merely JSON.parse'd and trusted — a collection
 	// blob is written by other people's devices, which makes it at least as
 	// untrusted as a backup file someone hands you.
-	const items = (parsed.items ?? [])
-		.map(parseBackupItemPublic)
-		.filter((i): i is BackupItem => i !== null);
+	const rawItems = parsed.items ?? [];
+	const items = rawItems.map(parseBackupItemPublic).filter((i): i is BackupItem => i !== null);
+	// Unlike a personal sync pull (see sync.ts), every caller of this
+	// function is sync, never local-file import — a shared collection has no
+	// import/export path — so this is unconditionally worth reporting (#254).
+	if (items.length < rawItems.length) reportFailure('backup_item_parse_rejected');
 	const ballots = parseBallots(parsed.ballots);
 
 	return { version, dekVersion, items, ballots };
@@ -258,7 +287,10 @@ async function pushCollectionBlob(
 	});
 	if (res.status === 409) {
 		const body = (await res.json().catch(() => ({}))) as { error?: string };
-		if (/rotated/i.test(body.error ?? '')) throw new CollectionKeyRotatedError();
+		if (/rotated/i.test(body.error ?? '')) {
+			reportFailure('collection_key_rotated');
+			throw new CollectionKeyRotatedError();
+		}
 		return { ok: false, conflict: true };
 	}
 	if (!res.ok) throw new Error(`Collection sync PUT failed: ${res.status}`);
@@ -285,9 +317,10 @@ function jitteredBackoff(attempt: number): Promise<void> {
  */
 export async function fetchCollectionState(
 	collectionId: string,
-	dek: CryptoKey
+	dek: CryptoKey,
+	expectedDekVersion?: number
 ): Promise<{ items: MergeCandidate[]; ballots: Record<string, BallotEntry> }> {
-	const { items, ballots } = await pullCollectionBlob(collectionId, dek);
+	const { items, ballots } = await pullCollectionBlob(collectionId, dek, expectedDekVersion);
 	return { items, ballots };
 }
 
@@ -309,11 +342,12 @@ export async function syncCollectionItems(
 	collectionId: string,
 	dek: CryptoKey,
 	localItems: MergeCandidate[],
-	applyMutation: (merged: MergeCandidate[]) => MergeCandidate[]
+	applyMutation: (merged: MergeCandidate[]) => MergeCandidate[],
+	expectedDekVersion?: number
 ): Promise<MergeCandidate[]> {
 	let current = localItems;
 	for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-		const pulled = await pullCollectionBlob(collectionId, dek);
+		const pulled = await pullCollectionBlob(collectionId, dek, expectedDekVersion);
 		const merged = mergeCollectionItems(current, pulled.items);
 		const next = applyMutation(merged);
 
@@ -335,6 +369,7 @@ export async function syncCollectionItems(
 		current = next;
 		await jitteredBackoff(attempt);
 	}
+	reportFailure('collection_sync_409_exhausted');
 	throw new Error('Could not sync this collection after repeated conflicts.');
 }
 
@@ -349,11 +384,12 @@ export async function syncCollectionBallots(
 	collectionId: string,
 	dek: CryptoKey,
 	localBallots: Record<string, BallotEntry>,
-	applyMutation: (merged: Record<string, BallotEntry>) => Record<string, BallotEntry>
+	applyMutation: (merged: Record<string, BallotEntry>) => Record<string, BallotEntry>,
+	expectedDekVersion?: number
 ): Promise<Record<string, BallotEntry>> {
 	let current = localBallots;
 	for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-		const pulled = await pullCollectionBlob(collectionId, dek);
+		const pulled = await pullCollectionBlob(collectionId, dek, expectedDekVersion);
 		const merged = mergeCollectionBallots(current, pulled.ballots);
 		const next = applyMutation(merged);
 
@@ -363,6 +399,7 @@ export async function syncCollectionBallots(
 		current = next;
 		await jitteredBackoff(attempt);
 	}
+	reportFailure('collection_sync_409_exhausted');
 	throw new Error('Could not sync this collection after repeated conflicts.');
 }
 

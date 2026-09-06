@@ -414,16 +414,23 @@ export function deserializeAppState(raw: unknown): {
 	items: BackupItem[];
 	prefs?: AppStatePrefs;
 	services?: Provider[];
+	/** Items present in the payload that parseBackupItem rejected outright.
+	 *  A sync caller (see sync.ts) reports this as a failure signal (#254) —
+	 *  a well-formed-looking item from another of the user's own devices
+	 *  failing validation is exactly the kind of silent failure that's
+	 *  otherwise unknowable. A backup-file-import caller has no reason to
+	 *  report it: a hand-edited or years-old export rejecting some items
+	 *  isn't a distributed-system health signal, just an expected part of
+	 *  reading untrusted input. */
+	rejectedItemCount: number;
 } {
 	if (!raw || typeof raw !== 'object') throw new Error('Invalid backup file');
 
 	// Pre-versioning format: a bare array of items, nothing else.
 	if (Array.isArray(raw)) {
-		const items = raw
-			.slice(0, 5000)
-			.map(parseBackupItem)
-			.filter((i): i is BackupItem => i !== null);
-		return { items };
+		const candidates = raw.slice(0, 5000);
+		const items = candidates.map(parseBackupItem).filter((i): i is BackupItem => i !== null);
+		return { items, rejectedItemCount: candidates.length - items.length };
 	}
 
 	const payload = raw as Record<string, unknown>;
@@ -432,12 +439,8 @@ export function deserializeAppState(raw: unknown): {
 		throw new Error('Unsupported backup format version');
 	}
 
-	const items = Array.isArray(payload.items)
-		? payload.items
-				.slice(0, 5000)
-				.map(parseBackupItem)
-				.filter((i): i is BackupItem => i !== null)
-		: [];
+	const itemCandidates = Array.isArray(payload.items) ? payload.items.slice(0, 5000) : [];
+	const items = itemCandidates.map(parseBackupItem).filter((i): i is BackupItem => i !== null);
 
 	const prefs = parsePrefs(payload.prefs);
 
@@ -450,6 +453,7 @@ export function deserializeAppState(raw: unknown): {
 
 	return {
 		items,
+		rejectedItemCount: itemCandidates.length - items.length,
 		...(prefs ? { prefs } : {}),
 		...(services && services.length > 0 ? { services } : {})
 	};
