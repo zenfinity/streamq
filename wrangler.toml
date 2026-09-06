@@ -12,10 +12,3 @@ binding = "DB"
 database_name = "queuest-db"
 database_id = "84d447c9-fcbf-4ff3-ac32-90a28a7dd668"
 migrations_dir = "migrations"
-
-# Content-free failure counters (#254) — no user id, no collection id, no
-# payload beyond a failure-class name. The dataset is created automatically
-# on first write; there's no separate provisioning step like D1/KV need.
-[[analytics_engine_datasets]]
-binding = "FAILURES"
-dataset = "queuest_failures"

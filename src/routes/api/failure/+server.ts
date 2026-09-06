@@ -1,6 +1,7 @@
 import type { RequestHandler } from './$types';
 import { apiError, checkSameOrigin } from '$lib/server/api';
 import { checkRateLimit } from '$lib/server/rate-limit';
+import { incrementFailureCount } from '$lib/server/failure-counter';
 
 // The exact set of classes callers may report — an arbitrary-string sink
 // would turn this into a free-form write endpoint, which defeats the whole
@@ -23,13 +24,16 @@ const KNOWN_CLASSES = new Set([
 const RATE_LIMIT = { max: 30, windowSeconds: 60 };
 
 /**
- * Increments an Analytics Engine counter for one failure class. No user id,
- * no collection id, no payload beyond the class name itself — see the
- * module comment on $lib/report-failure for why this exists and what it
+ * Increments a per-day KV counter for one failure class. No user id, no
+ * collection id, no payload beyond the class name itself — see the module
+ * comment on $lib/report-failure for why this exists and what it
  * deliberately does not collect. Unauthenticated by design: the failures
  * being counted (a 409-retry loop exhausting, a collection blob refusing to
  * decrypt) can happen to a client whose own session is part of what's
- * broken, and the class name alone carries no exploitable signal.
+ * broken, and the class name alone carries no exploitable signal. Reuses
+ * SHARE_KV rather than a dedicated binding — same namespace this endpoint
+ * already needs for rate-limiting, and one fewer piece of infrastructure to
+ * provision and keep working.
  */
 export const POST: RequestHandler = async ({ request, platform, getClientAddress }) => {
 	const originError = checkSameOrigin(request);
@@ -50,10 +54,7 @@ export const POST: RequestHandler = async ({ request, platform, getClientAddress
 	const failureClass = typeof body?.class === 'string' ? body.class : '';
 	if (!KNOWN_CLASSES.has(failureClass)) return apiError(400, 'Unknown failure class');
 
-	// The dataset is created automatically on first write — no separate
-	// provisioning step, unlike D1/KV. Absent in local dev (no Analytics
-	// Engine emulation), so this is a no-op there rather than an error.
-	platform?.env?.FAILURES?.writeDataPoint({ blobs: [failureClass], indexes: [failureClass] });
+	await incrementFailureCount(kv, failureClass);
 
 	return new Response(null, { status: 204 });
 };

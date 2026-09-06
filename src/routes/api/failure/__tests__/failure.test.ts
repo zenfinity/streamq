@@ -17,15 +17,17 @@ vi.mock('$lib/server/rate-limit', () => ({
 	checkRateLimit: (...args: unknown[]) => checkRateLimit(...args)
 }));
 
+const incrementFailureCount = vi.fn();
+vi.mock('$lib/server/failure-counter', () => ({
+	incrementFailureCount: (...args: unknown[]) => incrementFailureCount(...args)
+}));
+
 const { POST } = await import('../+server');
 const { FAILURE_CLASSES } = await import('$lib/report-failure');
 
 type PostEvent = Parameters<typeof POST>[0];
 
-function mockEvent(
-	body: unknown,
-	opts: { kv?: unknown; writeDataPoint?: (e: unknown) => void } = {}
-): PostEvent {
+function mockEvent(body: unknown, opts: { kv?: unknown } = {}): PostEvent {
 	const request = new Request('https://example.com', {
 		method: 'POST',
 		headers: { 'sec-fetch-site': 'same-origin' },
@@ -33,12 +35,7 @@ function mockEvent(
 	});
 	return {
 		request,
-		platform: {
-			env: {
-				SHARE_KV: 'kv' in opts ? opts.kv : {},
-				FAILURES: opts.writeDataPoint ? { writeDataPoint: opts.writeDataPoint } : undefined
-			}
-		},
+		platform: { env: { SHARE_KV: 'kv' in opts ? opts.kv : {} } },
 		getClientAddress: () => '127.0.0.1'
 	} as unknown as PostEvent;
 }
@@ -46,6 +43,7 @@ function mockEvent(
 describe('POST /api/failure', () => {
 	beforeEach(() => {
 		checkRateLimit.mockReset().mockResolvedValue(true);
+		incrementFailureCount.mockReset().mockResolvedValue(undefined);
 	});
 
 	it('rejects cross-site requests', async () => {
@@ -60,52 +58,48 @@ describe('POST /api/failure', () => {
 			getClientAddress: () => '127.0.0.1'
 		} as unknown as PostEvent);
 		expect(res.status).toBe(403);
+		expect(incrementFailureCount).not.toHaveBeenCalled();
 	});
 
 	it('no-ops when the KV binding is unavailable, rather than erroring', async () => {
 		const res = await POST(mockEvent({ class: 'sync_409_exhausted' }, { kv: undefined }));
 		expect(res.status).toBe(204);
+		expect(incrementFailureCount).not.toHaveBeenCalled();
 	});
 
 	it('returns 429 once the rate limit is exceeded', async () => {
 		checkRateLimit.mockResolvedValue(false);
 		const res = await POST(mockEvent({ class: 'sync_409_exhausted' }));
 		expect(res.status).toBe(429);
+		expect(incrementFailureCount).not.toHaveBeenCalled();
 	});
 
 	it('rejects a class outside the known allowlist', async () => {
-		const writeDataPoint = vi.fn();
-		const res = await POST(mockEvent({ class: 'literally_anything' }, { writeDataPoint }));
+		const res = await POST(mockEvent({ class: 'literally_anything' }));
 		expect(res.status).toBe(400);
-		expect(writeDataPoint).not.toHaveBeenCalled();
+		expect(incrementFailureCount).not.toHaveBeenCalled();
 	});
 
 	it('rejects a missing or non-string class', async () => {
 		const res = await POST(mockEvent({}));
 		expect(res.status).toBe(400);
+		expect(incrementFailureCount).not.toHaveBeenCalled();
 	});
 
 	it('accepts every class $lib/report-failure actually reports, not just the ones this test happens to name', async () => {
 		for (const cls of FAILURE_CLASSES) {
-			const res = await POST(mockEvent({ class: cls }, { writeDataPoint: vi.fn() }));
+			const res = await POST(mockEvent({ class: cls }));
 			expect(res.status).toBe(204);
 		}
+		expect(incrementFailureCount).toHaveBeenCalledTimes(FAILURE_CLASSES.length);
 	});
 
-	it('writes one content-free data point for a known class', async () => {
-		const writeDataPoint = vi.fn();
-		const res = await POST(mockEvent({ class: 'collection_key_rotated' }, { writeDataPoint }));
+	it('increments the counter for a known class', async () => {
+		const kv = {};
+		const res = await POST(mockEvent({ class: 'collection_key_rotated' }, { kv }));
 
 		expect(res.status).toBe(204);
-		expect(writeDataPoint).toHaveBeenCalledWith({
-			blobs: ['collection_key_rotated'],
-			indexes: ['collection_key_rotated']
-		});
-	});
-
-	it('no-ops when the FAILURES binding is unavailable (local dev), rather than erroring', async () => {
-		const res = await POST(mockEvent({ class: 'collection_key_rotated' }));
-		expect(res.status).toBe(204);
+		expect(incrementFailureCount).toHaveBeenCalledWith(kv, 'collection_key_rotated');
 	});
 
 	it('returns 400 for unparseable JSON rather than throwing', async () => {
